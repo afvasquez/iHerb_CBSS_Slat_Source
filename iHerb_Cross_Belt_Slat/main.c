@@ -135,7 +135,8 @@ void vSystemSetup( void ) {
 	//////////////////////////////////////////////////////////////////////////
 	// ** Using Timer 1
 	DDRB |= _BV(PORTB1);	// Set this as out PWM output
-	PORTB = 0;
+	DDRB &= 0b11111110;
+	PORTB &= 0b00000010;
 	TCNT1 = 0;				// clear counter
 	ICR1 = 255;				// 439.9956 Hz from 16 MHz clock
 	TCCR1A |= 0b10000010;	// non-inverting, fast PWM
@@ -234,6 +235,11 @@ void vSystemSetup( void ) {
 	
 	// Enable interrupts
 	sei();
+	
+	if ( ( PINB & 0x01 ) ) {	// Debug Run
+		myCOM.PacketData[1] = 0x06;
+		fcnRunSetup();
+	}
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -241,7 +247,9 @@ void vSystemSetup( void ) {
 //////////////////////////////////////////////////////////////////////////
 // 1kHz Timer ISR
 ISR( TIMER0_COMPA_vect ) {
-	mySystem.clkCount++;
+	
+	// Timer Lock
+	if ( mySystem.SystemStatus != 'e' || myCOM.PacketRxStatus == 1 ) mySystem.clkCount++;
 	
 	// Data Timeout
 	if ( myCOM.PacketRxStatus == 1 ) {	// Determine if we are taking data timeout	(Currently Receiving a Packet)
