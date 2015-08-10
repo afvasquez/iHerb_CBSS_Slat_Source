@@ -82,6 +82,8 @@ int main(void)
 					mySystem.SystemStatus = ( uint8_t ) 'e';	// C - For COM
 				}
 			break;
+			case 'w':	// Data Wait
+			break;
 			default:
 			break;
 		}
@@ -236,7 +238,9 @@ void vSystemSetup( void ) {
 	// Enable interrupts
 	sei();
 	
+	mySystem.SystemStatus = 'w';	// Straight into the data wait protocol
 	if ( ( PINB & 0x01 ) ) {	// Debug Run
+		mySystem.SystemStatus = 'C';	// Process right away
 		myCOM.PacketData[1] = 0x06;
 		fcnRunSetup();
 	}
@@ -253,10 +257,13 @@ ISR( TIMER0_COMPA_vect ) {
 	
 	// Data Timeout
 	if ( myCOM.PacketRxStatus == 1 ) {	// Determine if we are taking data timeout	(Currently Receiving a Packet)
-		if ( ( ( uint8_t ) ( mySystem.clkCount - myCOM.TimeoutTickCount ) ) > ( ( uint8_t ) systemBYTE_TIMEOUT ) ) {	// If data has been timed out
+		if ( ( ( uint8_t ) ( mySystem.clkCount ) ) > ( ( uint8_t ) systemBYTE_TIMEOUT ) ) {	// If data has been timed out
 			
 			myCOM.DroppedPackets++;		// Add to the Dropped Packet Count
 			usartCleanPacket();	// Reset the data on the packet
+			
+			mySystem.SystemStatus = 'w';
+			UCSR0B = 0b10011000;	// Rx Enabled. Rx Interrupt Enabled
 		}
 	}
 }
@@ -270,41 +277,86 @@ ISR( TIMER0_COMPA_vect ) {
 // USART RX INTERRUPT SERVICE ROUTINE
 //////////////////////////////////////////////////////////////////////////
 // Rx ISR
+uint8_t intRxDummy;
 ISR( USART_RX_vect ) {
-	if ( myCOM.PacketRxStatus != 2 && myCOM.PacketRxStatus != 3 ) {	// Are we waiting for data?
-		if ( ( UCSR0A & (1<<RXC0) ) ) {	// If a byte has been received and is waiting to be picked up
-			// Reset main clock in order to avoid any overflow drama
-			mySystem.clkCount = 0;		// Reset clock
-			myCOM.TimeoutTickCount = mySystem.clkCount;	// Reset Timeout Counter
+	if ( myCOM.PacketRxStatus < 2 ) {	// Are we waiting for data?
+		if ( (UCSR0A & ( 1 << FE0 )) ) {
+			intRxDummy = UDR0;
+			myCOM.PacketData[0] = 0x00;
+			myCOM.PacketData[1] = 0xFE;
+			myCOM.PacketData[2] = 0xFE;
+			myCOM.PacketData[3] = 0xFE;	// Erroneous Data Byte
+			myCOM.PacketLength = 4;
+			myCOM.LoP = 0x00;
+			UCSR0B = 0b10001000;	// Rx Disabled. Rx Interrupt Enabled
+			mySystem.SystemStatus = 'C';	// Process Right Away
+			myCOM.PacketRxStatus = 2;	// Packet Rx Complete
+		} else if ( ( UCSR0A & (1<<RXC0) ) ) {	// If a byte has been received and is waiting to be picked up
 			
-			myCOM.PacketRxStatus = 1;	// We are in the process of receiving and packet
-			if ( !(UCSR0A & ( 1 << UPE0 )) ) {	// Is Parity fine?
+			if ( myCOM.PacketRxStatus == 0 ) {
+				myCOM.PacketRxStatus = 1;	// We are in the process of receiving and packet
+				mySystem.SystemStatus = 'w';
+			}
+			
+			
+			if ( !(UCSR0A & ( 1 << UPE0 ) ) ) {	// Is Parity fine?
 				// Parity OK
 				myCOM.PacketData[myCOM.PacketLength] = UDR0;
 			} else {	// Error in Rx Detected
 				myCOM.PacketData[myCOM.PacketLength] = 0xFE;	// Erroneous Data Byte
+				intRxDummy = UDR0;
+				myCOM.IsPacketCorrupt = 1;
 			}
 			
 			
 			myCOM.PacketLength++;	// Increment Packet Length
 			// Check if LoP counter is being used
-			if ( myCOM.LoP < 0xFF ) myCOM.LoP--; // DECREASE: LoP Count
+			myCOM.LoP--; // DECREASE: LoP Count
+			
+			if ( myCOM.PacketLength > 7 ) {
+				myCOM.LoP = 0;
+			}
+			
 			if ( myCOM.PacketLength == 2 ) {	// Set LoP if this is the second byte
-				myCOM.command = myCOM.PacketData[myCOM.PacketLength - 1] & 0b10000000;
-				
-				// Set the right LOP for the right type of data
-				if ( myCOM.command ) {
-					// Request one more byte if this is a RUN-TIME command
-					myCOM.LoP = 1;
+				if ( myCOM.PacketData[0] == myCOM.PacketData[1] ) {
+					myCOM.command = myCOM.PacketData[myCOM.PacketLength - 1] & 0b10000000;
+					
+					// Set the right LOP for the right type of data
+					if ( myCOM.command ) {
+						// Request one more byte if this is a RUN-TIME command
+						myCOM.LoP = 1;
+					} else {
+						// Request as much data as possible
+						myCOM.LoP = 6;
+					}
 				} else {
-					// Request as much data as possible
-					myCOM.LoP = 6;
+					intRxDummy = UDR0;
+					usartCleanPacket();
+					mySystem.SystemStatus = 'w';	//	Finish Transmission and go back to idling
 				}
 			}
 			
-			if ( !myCOM.LoP ) {
+			if ( myCOM.LoP == 0 && myCOM.PacketLength > 2 && myCOM.IsPacketCorrupt == 0) {
+				UCSR0B = 0b10001000;	// Rx Disabled. Rx Interrupt Enabled
+				mySystem.SystemStatus = 'C';
 				myCOM.PacketRxStatus = 2;	// Packet Rx Complete
-				UCSR0B = 0b10000000;	// Tx/Rx Enabled. Rx Interrupt Enabled
+			}
+			
+			// Reset main clock in order to avoid any overflow drama
+			mySystem.clkCount = 0;		// Reset clock
+			
+			if ( myCOM.PacketLength == 1 ) {
+				if ( myCOM.PacketData[0] == 0xFE ) {
+					intRxDummy = UDR0;
+					// PORTC |= 0x01;	// YELLOW
+					
+					// End of action, reset everything
+					mySystem.clkCount = 0;
+					usartCleanPacket();
+					mySystem.SystemStatus = 'w';	//	Finish Transmission and go back to idling
+					UCSR0C = 0b00110110;
+					UCSR0B = 0b10011000;	// Tx/Rx Enabled. Rx Interrupt Enabled
+				}
 			}
 		} // Timeout omitted, might have to be placed on timer
 	}
@@ -611,7 +663,7 @@ void fcnEndRun( void ) {
 	PORTD &= ~_BV(PORTD3);
 	//PORTD &= 0b11111101;
 	usartCleanPacket();
-	mySystem.SystemStatus = 'C';
+	mySystem.SystemStatus = 'w';	// Go straight into data wait
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -622,6 +674,6 @@ void fcnEndProgramming( void ) {
 		PORTD &= ~_BV(PORTD7);
 		mySystem.clkCount = 0;	// Reset Clock
 		usartCleanPacket();		// Reset Packet
-		mySystem.SystemStatus = 'C';
+		mySystem.SystemStatus = 'w';	// Go straight into data wait
 	}
 }
